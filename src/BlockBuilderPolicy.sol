@@ -17,8 +17,19 @@ import {IBlockBuilderPolicy, WorkloadId} from "./interfaces/IBlockBuilderPolicy.
 struct CachedWorkload {
     /// @notice The computed workload identifier
     WorkloadId workloadId;
+	PlatformId bytes32;
     /// @notice The keccak256 hash of the raw quote used to compute this workloadId
     bytes32 quoteHash;
+}
+
+/**
+ * @dev Specifies DCAP deployment platform (firmware, VMM flags & co)
+ */
+struct DCAPPlatformMetadata {
+	bytes mrtd;
+	bytes rtmr0;
+	bytes6 xFAM;
+	bytes6 tdAttributes
 }
 
 /**
@@ -55,6 +66,8 @@ contract BlockBuilderPolicy is
     /// This means the critical `_cachedIsAllowedPolicy` function is O(1) since we can directly check if a workloadId exists
     /// in the mapping
     mapping(bytes32 workloadId => WorkloadMetadata) private approvedWorkloads;
+
+	mapping(bytes32 platformId => DCAPPlatformMetadata) private approvedDCAPPlatforms;
 
     /// @inheritdoc IBlockBuilderPolicy
     address public registry;
@@ -120,7 +133,7 @@ contract BlockBuilderPolicy is
     /// @param blockContentHash The hash of the block content
     function _verifyBlockBuilderProof(address teeAddress, uint8 version, bytes32 blockContentHash) internal {
         // Check if the caller is an authorized TEE block builder for our Policy and update cache
-        (bool allowed, WorkloadId workloadId) = _cachedIsAllowedPolicy(teeAddress);
+        (bool allowed, bytes32 platformId, WorkloadId workloadId) = _cachedIsAllowedPolicy(teeAddress);
         require(allowed, UnauthorizedBlockBuilder(teeAddress));
 
         // At this point, we know:
@@ -133,11 +146,12 @@ contract BlockBuilderPolicy is
 
         bytes32 workloadKey = WorkloadId.unwrap(workloadId);
         string memory commitHash = approvedWorkloads[workloadKey].commitHash;
+		// We should extend this with platform id
         emit BlockBuilderProofVerified(teeAddress, workloadKey, version, blockContentHash, commitHash);
     }
 
     /// @inheritdoc IBlockBuilderPolicy
-    function isAllowedPolicy(address teeAddress) public view override returns (bool allowed, WorkloadId) {
+    function isAllowedPolicy(address teeAddress) public view override returns (bool allowed, bytes32, WorkloadId) {
         // Get full registration data and compute workload ID
         (, IFlashtestationRegistry.RegisteredTEE memory registration) =
             FlashtestationRegistry(registry).getRegistration(teeAddress);
@@ -145,17 +159,20 @@ contract BlockBuilderPolicy is
         // Invalid Registrations means the attestation used to register the TEE is no longer valid
         // and so we cannot trust any input from the TEE
         if (!registration.isValid) {
-            return (false, WorkloadId.wrap(0));
+            return (false, bytes32(0), WorkloadId.wrap(0));
         }
 
-        WorkloadId workloadId = workloadIdForTDRegistration(registration);
+        (bytes32 platformId, WorkloadId workloadId) = workloadIdForTDRegistration(registration);
 
         // Check if the workload exists in our approved workloads mapping
-        if (bytes(approvedWorkloads[WorkloadId.unwrap(workloadId)].commitHash).length > 0) {
-            return (true, workloadId);
+        if (
+			bytes(approvedWorkloads[WorkloadId.unwrap(workloadId)].commitHash).length > 0
+				&& bytes(approvedDCAPPlatforms[platformId].mrtd).length > 0
+		) {
+            return (true, platformId, workloadId);
         }
 
-        return (false, WorkloadId.wrap(0));
+        return (false, platformId, WorkloadId.wrap(0));
     }
 
     /// @notice isAllowedPolicy but with caching to reduce gas costs
@@ -171,7 +188,7 @@ contract BlockBuilderPolicy is
     /// @return True if the TEE is using an approved workload in the policy
     /// @return The workloadId of the TEE that is using an approved workload in the policy, or 0 if
     /// the TEE is not using an approved workload in the policy
-    function _cachedIsAllowedPolicy(address teeAddress) private returns (bool, WorkloadId) {
+    function _cachedIsAllowedPolicy(address teeAddress) private returns (bool, bytes32, WorkloadId) {
         // Get the current registration status (fast path)
         (bool isValid, bytes32 quoteHash) = FlashtestationRegistry(registry).getRegistrationStatus(teeAddress);
         if (!isValid) {
@@ -193,11 +210,11 @@ contract BlockBuilderPolicy is
             }
         } else {
             // Cache miss or quote changed - use the view function to get the result
-            (bool allowed, WorkloadId workloadId) = isAllowedPolicy(teeAddress);
+            (bool allowed, bytes32 platformId, WorkloadId workloadId) = isAllowedPolicy(teeAddress);
 
             if (allowed) {
                 // Update cache with the new workload ID
-                cachedWorkloads[teeAddress] = CachedWorkload({workloadId: workloadId, quoteHash: quoteHash});
+                cachedWorkloads[teeAddress] = CachedWorkload({workloadId: workloadId, platformId: platformId, quoteHash: quoteHash});
             }
 
             return (allowed, workloadId);
@@ -209,22 +226,25 @@ contract BlockBuilderPolicy is
         public
         pure
         override
-        returns (WorkloadId)
+        returns (bytes32, WorkloadId)
     {
-        return WorkloadId.wrap(
-            keccak256(
+        return (
+			keccak256(
                 bytes.concat(
                     registration.parsedReportBody.mrTd,
                     registration.parsedReportBody.rtMr0,
-                    registration.parsedReportBody.rtMr1,
-                    registration.parsedReportBody.rtMr2,
-                    registration.parsedReportBody.rtMr3,
-                    // VMM configuration
-                    registration.parsedReportBody.mrConfigId,
                     registration.parsedReportBody.xFAM,
                     registration.parsedReportBody.tdAttributes
-                )
-            )
+				)
+			),
+			WorkloadId.wrap(
+				keccak256(
+					bytes.concat(
+						registration.parsedReportBody.rtMr1,
+						registration.parsedReportBody.rtMr2,
+					)
+				)
+			)
         );
     }
 

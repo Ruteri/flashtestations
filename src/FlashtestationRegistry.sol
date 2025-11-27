@@ -11,8 +11,9 @@ import {
 import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
 import {IAttestation} from "./interfaces/IAttestation.sol";
 import {IFlashtestationRegistry} from "./interfaces/IFlashtestationRegistry.sol";
-import {QuoteParser} from "./utils/QuoteParser.sol";
+import {QuoteParser, ECDSAQuoteV4AuthDataGetter, unsafeAuthDataFromQuote} from "./utils/QuoteParser.sol";
 import {TD10ReportBody} from "automata-dcap-attestation/contracts/types/V4Structs.sol";
+import {TCBStatus} from "@automata-network/on-chain-pccs/helpers/FmspcTcbHelper.sol";
 
 /**
  * @title FlashtestationRegistry
@@ -28,6 +29,9 @@ contract FlashtestationRegistry is
     ReentrancyGuardTransientUpgradeable
 {
     using ECDSA for bytes32;
+
+	ECDSAQuoteV4AuthDataGetter private quoteAuthGetter;
+	mapping(bytes fmspcBytes -> address teeAddress) private fmspcLookup;
 
     // ============ Constants ============
 
@@ -148,6 +152,7 @@ contract FlashtestationRegistry is
         // now we know the quote is valid, we can safely parse the output into the TDX report body,
         // from which we'll extract the data we need to register the TEE
         TD10ReportBody memory td10ReportBody = QuoteParser.parseV4VerifierOutput(output);
+		bytes6 fmspc = QuoteParser.unsafeParseV4VerifierOutput(output);
 
         // Binding the tee address and extended report data to the quote
         require(
@@ -182,6 +187,8 @@ contract FlashtestationRegistry is
             isValid: true,
             quoteHash: newQuoteHash
         });
+
+		fmspcLookup[fmspc] = teeAddress;
 
         emit TEEServiceRegistered(teeAddress, rawQuote, previouslyRegistered);
     }
@@ -244,6 +251,46 @@ contract FlashtestationRegistry is
         registeredTEEs[teeAddress].isValid = false;
         emit TEEServiceInvalidated(teeAddress);
     }
+
+	/**
+	  * @dev Cheaper invalidation for the case of outdated collateral and revoked certificates
+	  */
+	function fastInvalidateOutdatedCollateral(address teeAddress) {
+		RegisteredTEE memory registeredTEE = registeredTEEs[teeAddress];
+
+		bytes memory rawAuthData = unsafeAuthDataFromQuote(registeredTEE.rawQuote);
+
+		(bool success, ECDSAQuoteV4AuthData memory authData, bytes memory rawQeReport) = quoteAuthGetter.getECDSAQuoteV4AuthData(rawAuthData);
+		if (!success) {
+			registeredTEEs[teeAddress].isValid = false;
+			emit TEEServiceInvalidated(teeAddress);
+			return
+		}
+
+        // Fetch FMSPC TCB
+        X509CertObj[] memory parsedCerts = authData.qeReportCertData.certification.pck.pckChain;
+        PCKCertTCB memory pckTcb = authData.qeReportCertData.certification.pck.pckExtension;
+        (TCBLevelsObj[] memory tcbLevels, TDXModule memory tdxModule, TDXModuleIdentity[] memory tdxModuleIdentities) =
+            pccsRouter.getFmspcTcbV3(TcbId.TDX, bytes6(pckTcb.fmspcBytes));
+
+        // Verify cert chain. More expensive and less likely so should be below tcb level check.
+        // success = verifyCertChain(pccsRouter, pccsRouter.crlHelperAddr(), parsedCerts);
+        // if (!success) {
+        //    return (success, "Failed to verify X509 Chain", ret);
+        // }
+
+        // Fetch FMSPC TCB, then get the TCB Status from the TDXComponent of the matching TCBLevel
+        TCBStatus tcbStatus;
+        uint256 tcbLevelSelected;
+		// Note: getTDXTcbStatus is internal
+        (success, tcbStatus, tcbLevelSelected) = TCBInfoV3Base.getTDXTcbStatus(tcbLevels, pckTcb, quote.reportBody.teeTcbSvn);
+        require(!success || tcbStatus != TCBStatus.OK, TEEIsStillValid(teeAddress))
+
+		// Note: once we know the tcb levels were outdated, we can quickly and cheaply invalidate all of the other TEEs registered with the same ones (likely)
+
+		registeredTEEs[teeAddress].isValid = false;
+		emit TEEServiceInvalidated(teeAddress);
+	}
 
     /// @inheritdoc IFlashtestationRegistry
     function invalidatePreviousSignature(uint256 _nonce) external override {

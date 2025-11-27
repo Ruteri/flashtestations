@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {TD10ReportBody} from "automata-dcap-attestation/contracts/types/V4Structs.sol";
+import {TD10ReportBody, ECDSAQuoteV4AuthData} from "automata-dcap-attestation/contracts/types/V4Structs.sol";
 import {BytesUtils} from "@automata-network/on-chain-pccs/utils/BytesUtils.sol";
 import {TD_REPORT10_LENGTH, TDX_TEE, HEADER_LENGTH} from "automata-dcap-attestation/contracts/types/Constants.sol";
+import {PCCSRouter} from "automata-dcap-attestation/contracts/PCCSRouter.sol";
+import {QuoteVerifierBase} from "automata-dcap-attestation/contracts/bases/QuoteVerifierBase.sol";
+
 
 /**
  * @title QuoteParser
@@ -52,6 +55,10 @@ library QuoteParser {
 
         return parseRawReportBody(serializedOutput.substring(SERIALIZED_OUTPUT_OFFSET, TD_REPORT10_LENGTH));
     }
+
+    function unsafeParseV4VerifierOutput(bytes memory serializedOutput) internal pure returns (bytes6) {
+		return serializedOutput.substring(SERIALIZED_OUTPUT_OFFSET-6, 6)
+	}
 
     /**
      * @notice Parses a V4 TDX quote into a TD10ReportBody
@@ -119,4 +126,73 @@ library QuoteParser {
         bytes4 teeType = bytes4(rawReportBody.substring(2, 4)); // 4 bytes
         require(teeType == TDX_TEE, InvalidTEEType(teeType));
     }
+}
+
+contract ECDSAQuoteV4AuthDataGetter is QuoteVerifierBase {
+    constructor(address _router) QuoteVerifierBase(_router, 4) {}
+
+    function getECDSAQuoteV4AuthData(bytes memory rawAuthData)
+        external
+        view
+        returns (bool success, ECDSAQuoteV4AuthData memory authDataV4, bytes memory rawQeReport)
+    {
+        authDataV4.ecdsa256BitSignature = rawAuthData[0:64];
+        authDataV4.ecdsaAttestationKey = rawAuthData[64:128];
+
+        uint256 qeReportCertType = BELE.leBytesToBeUint(rawAuthData[128:130]);
+        if (qeReportCertType != 6) {
+            return (false, authDataV4, rawQeReport);
+        }
+        uint256 qeReportCertSize = BELE.leBytesToBeUint(rawAuthData[130:134]);
+
+        rawQeReport = rawAuthData[134:518];
+        authDataV4.qeReportCertData.qeReportSignature = rawAuthData[518:582];
+
+        uint16 qeAuthDataSize = uint16(BELE.leBytesToBeUint(rawAuthData[582:584]));
+        authDataV4.qeReportCertData.qeAuthData.parsedDataSize = qeAuthDataSize;
+        uint256 offset = 584;
+        authDataV4.qeReportCertData.qeAuthData.data = rawAuthData[offset:offset + qeAuthDataSize];
+        offset += qeAuthDataSize;
+
+        uint16 certType = uint16(BELE.leBytesToBeUint(rawAuthData[offset:offset + 2]));
+        // we only support certType == 5 for now...
+        if (certType != 5) {
+            return (false, authDataV4, rawQeReport);
+        }
+
+        authDataV4.qeReportCertData.certification.certType = certType;
+        offset += 2;
+        uint32 certDataSize = uint32(BELE.leBytesToBeUint(rawAuthData[offset:offset + 4]));
+        offset += 4;
+        authDataV4.qeReportCertData.certification.certDataSize = certDataSize;
+        bytes memory rawCertData = rawAuthData[offset:offset + certDataSize];
+        offset += certDataSize;
+
+        if (offset - 134 != qeReportCertSize) {
+            return (false, authDataV4, rawQeReport);
+        }
+
+        // parsing complete, now we need to decode some raw data
+
+        (success, authDataV4.qeReportCertData.qeReport) = parseEnclaveReport(rawQeReport);
+        if (!success) {
+            return (false, authDataV4, rawQeReport);
+        }
+
+        (success, authDataV4.qeReportCertData.certification.pck) =
+            getPckCollateral(pccsRouter.pckHelperAddr(), certType, rawCertData);
+        if (!success) {
+            return (false, authDataV4, rawQeReport);
+        }
+    }
+}
+
+function unsafeAuthDataFromQuote(bytes rawQuote) returns (bytes memory) {
+	uint256 offset = HEADER_LENGTH;
+	offset += TD_REPORT10_LENGTH;
+
+	uint256 localAuthDataSize = BELE.leBytesToBeUint(quote[offset:offset + 4]);
+	offset += 4;
+
+	return rawQuote[offset:offset + localAuthDataSize];
 }
